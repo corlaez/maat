@@ -11,168 +11,156 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
- * Maat helps to define validation constraints and enforce them.
- * Similar to jakarta validation, all violations are gathered in one place and reported together; in contrast to it
- * constraints are defined at validation sites and external to data declaration.
+ * Maat — an error accumulator. You create one, thread it through your validation,
+ * and it gathers ALL failures in one place so they can be reported together,
+ * instead of failing on the first bad value.
  *
- * Validation rules should not be collocated with data classes as they usually differ from use case
- * to use case.
+ * <p>Like Jakarta Bean Validation, it has simple violations. What differs is *placement*. Validity
+ * is not declared on the type itself with annotations; you write checks as ordinary code wherever they belong.
  *
- *   - intrinsic (parse) errors      -> recorded by Data objects   (Source.DATA)
- *   - contextual (use case) errors  -> recorded by the Context     (Source.CONTEXT)
+ * <h2>Three ways in</h2>
  *
- * This is the DCI-compatible answer to "Jakarta Validation can show many
- * violations at once": instead of each value object throwing on the first bad
- * field (fail-fast, one error per round-trip), the value object records into the
- * shared Notification and remains constructible-but-tainted. The Context inspects
- * {@link #hasErrors()} before enacting the use case and never uses a tainted object.
+ * <ul>
+ *   <li><b>Root</b> — {@link #value(String, Object)} records a top-level field
+ *       into this Maat.</li>
+ *   <li><b>Scoped</b> — {@link #scope(String)} returns a {@link MaatScope} that
+ *       prefixes every path it records. Pass it into a value object's constructor
+ *       so the object can do its own intrinsic validation while the field name
+ *       (e.g. {@code "email"}) comes from the caller. Scopes nest, so paths
+ *       compose: {@code shipping.address.city}.</li>
+ *   <li><b>Static / report-free</b> — {@link #inline(Object)} pseudo-validates a
+ *       single value with no Maat at all, ending in a default, a fail-fast, or an
+ *       explicit bridge back into a Maat/scope.</li>
+ * </ul>
+ *
+ * <pre>{@code
+ * Maat maat = new Maat();
+ *
+ * // ROOT, top-level fields:
+ * maat.value("name", form.name()).notBlank("name.required", "Name is required");
+ *
+ * // SCOPED: hand a prefixing scope to a constructor; its paths become email.*
+ * Email email = new Email(form.email(), maat.scope("email"));
+ *
+ * // STATIC, no report — default or fail-fast:
+ * int port = Maat.inline(raw).convert(Integer::parseInt, "port.nan", "NaN").orElse(8080);
+ *
+ * if (maat.hasErrors()) return Result.rejected(maat.violations());
+ *
+ * // ...where Email validates itself under whatever scope it was given:
+ * // public Email(String raw, Maat.MaatScope scope) {
+ * //     this.value = Maat.inline(raw)
+ * //         .notBlank("required",  "Email is required")
+ * //         .matches(".+@.+\\..+", "malformed", "Email is malformed")
+ * //         .orElseAndReport(null, scope);   // records at the scope's path, e.g. "email"
+ * // }
+ * }</pre>
  *
  * <p>Java 8 compatible: no records, no {@code List.copyOf}, no {@code Stream.toList},
  * no {@code String.isBlank} — those are reimplemented or avoided below.
  *
- * <h2>Lifecycle</h2>
- * <pre>{@code
- * Notification n = new Notification();                 // created in the Interaction
- *
- * EmailAddress email = new EmailAddress(form.email(), n);   // DATA parse errors -> n
- * Password     pw    = new Password(form.password(), n);    // DATA parse errors -> n
- *
- * Notification.Scope c = n.forContext("UserRegistration");  // CONTEXT rules -> n
- * c.require(!users.existsByEmail(form.email()), "email", "email.taken",  "Email already registered");
- * c.require(form.acceptedTerms(),               "terms", "terms.required","You must accept the terms");
- *
- * if (n.hasErrors()) return Result.rejected(n.violations()); // report ALL at once
- * // ...enact
- * }</pre>
- *
- * <h2>Inside a Data constructor</h2>
- * <pre>{@code
- * public EmailAddress(String raw, Notification n) {
- *     Notification.Scope v = n.forData("EmailAddress");
- *     v.require(raw != null && raw.trim().length() > 0,   "email", "email.required",  "Email is required");
- *     v.require(raw != null && raw.matches(".+@.+\\..+"), "email", "email.malformed", "Email is malformed");
- *     this.value = raw; // best-effort; Context discards this object if n.hasErrors()
- * }
- * }</pre>
- *
- * <p>Not thread-safe by design: a use-case enactment is single-threaded within
- * its Context. If you enact concurrently, wrap the mutating methods or collect
- * into per-thread Notifications and {@link #merge(Notification)} them.
+ * <p>Not thread-safe by design: a validation pass normally runs on a single
+ * thread. If you validate concurrently, collect into per-thread instances and
+ * {@link #merge(Maat)} them.
  */
 public final class Maat {
-
-    /** Where a violation originated, so reports can separate parse vs use-case failures. */
-    public enum Source { DATA, CONTEXT }
-
-    public enum Severity { WARNING, ERROR }
+    private final List<Violation> violations = new ArrayList<>();
 
     /**
-     * A single recorded problem. Plain immutable value class (Java 8 — no record).
+     * A single recorded failure. Immutable.
      */
     public static final class Violation {
-        private final Source source;     // DATA (intrinsic/parse) or CONTEXT (use case)
-        private final String scope;      // originating type, e.g. "EmailAddress" (nullable)
-        private final String field;      // offending field/role, e.g. "email" (nullable)
-        private final String code;       // machine-readable key, e.g. "email.malformed" (nullable)
-        private final String message;    // human-readable, user-facing message
-        private final Severity severity; // ERROR blocks enactment; WARNING does not
+        private final String path;    // what failed, e.g. "email" or "shipping.city" (nullable)
+        private final String code;    // machine-readable key, e.g. "email.malformed" (nullable)
+        private final String message; // human-readable, user-facing message
 
-        public Violation(Source source, String scope, String field,
-                         String code, String message, Severity severity) {
-            this.source = Objects.requireNonNull(source, "source");
+        public Violation(String path, String code, String message) {
             this.message = Objects.requireNonNull(message, "message");
-            this.scope = scope;
-            this.field = field;
+            this.path = path;
             this.code = code;
-            this.severity = (severity == null) ? Severity.ERROR : severity;
         }
 
-        public Source source()     { return source; }
-        public String scope()      { return scope; }
-        public String field()      { return field; }
-        public String code()       { return code; }
-        public String message()    { return message; }
-        public Severity severity() { return severity; }
+        public String path()    { return path; }
+        public String code()    { return code; }
+        public String message() { return message; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (!(o instanceof Violation)) return false;
             Violation that = (Violation) o;
-            return source == that.source
-                    && severity == that.severity
-                    && Objects.equals(scope, that.scope)
-                    && Objects.equals(field, that.field)
+            return Objects.equals(path, that.path)
                     && Objects.equals(code, that.code)
                     && Objects.equals(message, that.message);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(source, scope, field, code, message, severity);
+            return Objects.hash(path, code, message);
         }
 
         @Override
         public String toString() {
-            String loc = (scope == null ? "" : scope) + (field == null ? "" : "." + field);
-            return "[" + severity + "] "
-                    + (loc.isEmpty() ? "" : loc + ": ")
+            String p = (path == null) ? "" : path;
+            return (p.isEmpty() ? "" : p + ": ")
                     + message
                     + (code == null ? "" : " (" + code + ")");
         }
     }
 
-    private final List<Violation> violations = new ArrayList<Violation>();
+    // ---- raw recording (instance) ------------------------------------------
 
-    // ---- raw recording -----------------------------------------------------
-
-    /** Record a violation directly. Returns {@code this} for chaining. */
-    public Notification add(Source source, String scope, String field,
-                            String code, String message, Severity severity) {
-        violations.add(new Violation(source, scope, field, code, message, severity));
+    /** Record a failure at an absolute path. Returns {@code this} for chaining. */
+    public Maat add(String path, String code, String message) {
+        violations.add(new Violation(path, code, message));
         return this;
     }
 
-    /**
-     * Guard helper: records an ERROR only when {@code ok} is false.
-     * Returns {@code ok} so callers can also branch on the result.
-     */
-    public boolean require(boolean ok, Source source, String scope, String field,
-                           String code, String message) {
-        if (!ok) add(source, scope, field, code, message, Severity.ERROR);
+    /** Value-less guard: records at {@code path} only when {@code ok} is false. Returns {@code ok}. */
+    public boolean require(boolean ok, String path, String code, String message) {
+        if (!ok) add(path, code, message);
         return ok;
     }
 
-    // ---- scoped recorders --------------------------------------------------
+    /** Begin a collect-only chain for a top-level field. */
+    public <T> Value<T> value(String name, T value) {
+        return new Value<T>(this, null, name, value);
+    }
 
-    /** A recorder pre-tagged as DATA + the given type (for a Data constructor). */
-    public Scope forData(String scope) { return new Scope(Source.DATA, scope); }
+    /**
+     * A prefixing view of this Maat. Every path it records is prefixed with
+     * {@code name}; pass it into a value object's constructor so the object
+     * validates itself while the field name comes from the caller.
+     */
+    public MaatScope scope(String name) {
+        return new MaatScope(this, name);
+    }
 
-    /** A recorder pre-tagged as CONTEXT + the given type (for the Interaction). */
-    public Scope forContext(String scope) { return new Scope(Source.CONTEXT, scope); }
+    // ---- static, report-free validation ------------------------------------
+
+    /**
+     * Begin a <b>static</b> validation chain for a single value, tied to no Maat
+     * and no collection. Ends in {@link MaatInline#orElse default},
+     * {@link MaatInline#get fail-fast}, or {@link MaatInline#orElseAndReport} to
+     * bridge a failure into a Maat/scope.
+     */
+    public static <T> MaatInline<T> inline(T value) {
+        return new MaatInline<T>(value);
+    }
 
     // ---- queries -----------------------------------------------------------
 
-    public boolean hasErrors() {
-        return violations.stream().anyMatch(v -> v.severity() == Severity.ERROR);
-    }
+    public boolean hasErrors() { return !violations.isEmpty(); }
 
-    public boolean isClean() { return !hasErrors(); }
+    public boolean isClean() { return violations.isEmpty(); }
 
-    public boolean hasErrorsFor(String field) {
-        return violations.stream()
-                .anyMatch(v -> v.severity() == Severity.ERROR && Objects.equals(v.field(), field));
+    public boolean hasErrorsFor(String path) {
+        return violations.stream().anyMatch(v -> Objects.equals(v.path(), path));
     }
 
     /** Defensive, unmodifiable copy of all violations. */
     public List<Violation> violations() {
         return Collections.unmodifiableList(new ArrayList<Violation>(violations));
-    }
-
-    public List<Violation> violations(Source source) {
-        return violations.stream()
-                .filter(v -> v.source() == source)
-                .collect(Collectors.toList());
     }
 
     public List<String> messages() {
@@ -183,16 +171,16 @@ public final class Maat {
 
     // ---- composition & boundary --------------------------------------------
 
-    /** Fold another Notification's violations into this one. */
-    public Notification merge(Notification other) {
+    /** Fold another Maat's violations into this one. */
+    public Maat merge(Maat other) {
         this.violations.addAll(other.violations);
         return this;
     }
 
     /**
-     * Throw at a boundary that prefers exceptions over a result object.
-     * Note: in DbC terms this is for the *input boundary* (expected bad input),
-     * not for programmer-bug assertions deeper in the model.
+     * Throw at a boundary that prefers exceptions over a result object. This is
+     * meant for expected bad input at a boundary, not for programmer-bug
+     * assertions deep in your code.
      */
     public void throwIfErrors() {
         if (hasErrors()) throw new ValidationException(this);
@@ -200,9 +188,20 @@ public final class Maat {
 
     @Override
     public String toString() {
-        if (violations.isEmpty()) return "Notification: clean";
-        return "Notification (" + violations.size() + "):\n"
+        if (violations.isEmpty()) return "Maat: clean";
+        return "Maat (" + violations.size() + "):\n"
                 + violations.stream().map(v -> "  " + v).collect(Collectors.joining("\n"));
+    }
+
+    // ---- helpers -----------------------------------------------------------
+
+    /** Join a scope prefix and a leaf name into a dotted path (either may be empty/null). */
+    static String join(String prefix, String name) {
+        boolean hasP = prefix != null && !prefix.isEmpty();
+        boolean hasN = name != null && !name.isEmpty();
+        if (hasP && hasN) return prefix + "." + name;
+        if (hasP) return prefix;
+        return hasN ? name : null;
     }
 
     /**
@@ -220,157 +219,144 @@ public final class Maat {
     }
 
     /**
-     * A lightweight view that tags every error it records with a fixed
-     * {@link Source} and scope, so a Data constructor or Context doesn't repeat
-     * its own type name on every check.
+     * A prefixing view of a Maat. Created by {@link Maat#scope(String)} or
+     * {@link #scope(String)}; nesting composes prefixes with dots. Hand one to a
+     * constructor so the object reports under the caller-chosen path.
      */
-    public final class Scope {
-        private final Source source;
-        private final String scope;
+    public static final class MaatScope {
+        private final Maat maat;
+        private final String prefix;
 
-        Scope(Source source, String scope) {
-            this.source = source;
-            this.scope = scope;
+        MaatScope(Maat maat, String prefix) {
+            this.maat = maat;
+            this.prefix = prefix;
         }
 
-        /** Records an ERROR when {@code ok} is false. Returns {@code ok}. */
-        public boolean require(boolean ok, String field, String code, String message) {
-            return Notification.this.require(ok, source, scope, field, code, message);
+        /** This scope's full prefix path. */
+        public String path() { return prefix; }
+
+        /** A nested scope: {@code scope("address").scope("city")} -> "address.city". */
+        public MaatScope scope(String name) {
+            return new MaatScope(maat, join(prefix, name));
         }
 
-        public Scope error(String field, String code, String message) {
-            add(source, scope, field, code, message, Severity.ERROR);
-            return this;
+        /** Begin a collect-only chain for {@code name} under this scope. */
+        public <T> Value<T> value(String name, T value) {
+            return new Value<T>(maat, prefix, name, value);
         }
 
-        public Scope warn(String field, String code, String message) {
-            add(source, scope, field, code, message, Severity.WARNING);
-            return this;
+        /** Record a failure at {@code prefix.name}. Returns the underlying Maat. */
+        public Maat add(String name, String code, String message) {
+            maat.add(join(prefix, name), code, message);
+            return maat;
         }
 
-        /**
-         * Begin a fluent, short-circuiting validation chain for one field.
-         * Every error the chain records inherits this scope's Source + scope,
-         * so the DCI origin tagging is preserved.
-         */
-        public <T> Field<T> field(String field, T value) {
-            return new Field<T>(Notification.this, source, scope, field, value);
+        /** Value-less guard under this scope. */
+        public boolean require(boolean ok, String name, String code, String message) {
+            return maat.require(ok, join(prefix, name), code, message);
+        }
+
+        /** Record at exactly this scope's prefix (used by the inline bridge). */
+        void reportHere(String code, String message) {
+            maat.add(prefix, code, message);
         }
     }
 
     /**
-     * A fluent, single-field validation chain that records into the enclosing
-     * Notification with a fixed Source + scope.
+     * Shared validation verbs for both chain types. Package-private: not part of
+     * the public API. Uses the self-type pattern so each verb returns the concrete
+     * chain type ({@link Value} or {@link MaatInline}). The base does not know
+     * where a failure goes; it calls {@link #capture}, which {@link Value} sends to
+     * its Maat and {@link MaatInline} keeps locally. The chain short-circuits after
+     * the first failure.
      *
-     * <p>This is the Validly-style ergonomics layer — declarative verbs, a
-     * type-changing {@code convert} (parse-as-validation), and per-field
-     * short-circuit — but it does NOT fight DCI: you only obtain a Field from
-     * {@link Scope#field(String, Object)} (i.e. via {@code forData(...)} or
-     * {@code forContext(...)}), so the collector stays Context-owned and every
-     * error remains tagged by origin. There is no separate validator object;
-     * the chain lives wherever the Data constructor or Context already is.
-     *
-     * <p>Semantics:
-     * <ul>
-     *   <li><b>Short-circuit per field:</b> once a step fails, later steps in
-     *       this chain are skipped — one bad value yields one error, not a
-     *       cascade of follow-on errors.</li>
-     *   <li><b>Optional by default:</b> only the presence checks ({@link #notNull},
-     *       {@link #notBlank}) fail on null; other verbs skip a null value.
-     *       Lead with a presence check to make a field required.</li>
-     *   <li><b>convert short-circuits:</b> a throwing or null-returning
-     *       conversion records an error and stops the chain, mirroring Validly's
-     *       mustConvert — even though the overall Notification is "note-all".</li>
-     * </ul>
-     *
-     * <pre>{@code
-     * // DATA: intrinsic parse + format, valid-or-noted by construction
-     * this.value = n.forData("EmailAddress")
-     *         .field("email", raw)
-     *         .notBlank("email.required",  "Email is required")
-     *         .matches(".+@.+\\..+", "email.malformed", "Email is malformed")
-     *         .convert(String::toLowerCase, "email.malformed", "Email is malformed")
-     *         .orElse(null);   // Context discards this object if n.hasErrors()
-     *
-     * // CONTEXT: a conditional, contextual rule
-     * n.forContext("UserRegistration")
-     *         .field("ssn", form.ssn())
-     *         .when(form.age() >= 18, f -> f.notBlank("ssn.required", "Required for adults"));
-     * }</pre>
+     * <p>Optional by default: only {@code notNull}/{@code notBlank} fail on null;
+     * other verbs skip a null value. Lead with a presence check to require a field.
      */
-    public static final class Field<T> {
-        private final Notification note;
-        private final Source source;
-        private final String scope;
-        private final String field;
-        private T value;
-        private boolean failed;
+    abstract static class Check<SELF extends Check<SELF, T>, T> {
+        T value;
+        boolean failed;
 
-        Field(Notification note, Source source, String scope, String field, T value) {
-            this.note = note;
-            this.source = source;
-            this.scope = scope;
-            this.field = field;
-            this.value = value;
+        Check(T value) { this.value = value; }
+
+        abstract SELF self();
+
+        abstract void capture(String code, String message);
+
+        final SELF fail(String code, String message) {
+            if (!failed) {
+                capture(code, message);
+                failed = true;
+            }
+            return self();
         }
 
-        private Field<T> fail(String code, String message) {
-            note.add(source, scope, field, code, message, Severity.ERROR);
-            failed = true;
-            return this;
+        public SELF notNull(String code, String message) {
+            if (failed) return self();
+            return value == null ? fail(code, message) : self();
         }
 
-        // ---- presence (use these to make a field required) -----------------
-
-        public Field<T> notNull(String code, String message) {
-            if (failed) return this;
-            return value == null ? fail(code, message) : this;
+        public SELF notBlank(String code, String message) {
+            if (failed) return self();
+            return (value == null || isBlank(value.toString())) ? fail(code, message) : self();
         }
 
-        public Field<T> notBlank(String code, String message) {
-            if (failed) return this;
-            return (value == null || isBlank(value.toString())) ? fail(code, message) : this;
+        public SELF must(Predicate<? super T> rule, String code, String message) {
+            if (failed || value == null) return self();
+            return rule.test(value) ? self() : fail(code, message);
         }
 
-        // ---- generic rule (skips a null value: optional by default) --------
-
-        public Field<T> must(Predicate<? super T> rule, String code, String message) {
-            if (failed || value == null) return this;
-            return rule.test(value) ? this : fail(code, message);
-        }
-
-        // ---- string conveniences (assume a CharSequence value) -------------
-
-        public Field<T> minLength(int min, String code, String message) {
+        public SELF minLength(int min, String code, String message) {
             return must(v -> v.toString().length() >= min, code, message);
         }
 
-        public Field<T> maxLength(int max, String code, String message) {
+        public SELF maxLength(int max, String code, String message) {
             return must(v -> v.toString().length() <= max, code, message);
         }
 
-        public Field<T> matches(String regex, String code, String message) {
+        public SELF matches(String regex, String code, String message) {
             return must(v -> v.toString().matches(regex), code, message);
         }
 
-        // ---- conditional (Validly's when/Then, contextual rules) -----------
-
         /** Applies {@code block} only when {@code condition} holds and the chain is still clean. */
-        public Field<T> when(boolean condition, Consumer<Field<T>> block) {
-            if (!failed && condition) block.accept(this);
-            return this;
+        public SELF when(boolean condition, Consumer<SELF> block) {
+            if (!failed && condition) block.accept(self());
+            return self();
+        }
+    }
+
+    /**
+     * Collect-only chain. Records into its Maat at {@code prefix.name} and chains
+     * across fields within the same scope via {@link #value(String, Object)}.
+     * Intentionally has no {@code get}/{@code orElse}.
+     */
+    public static final class Value<T> extends Check<Value<T>, T> {
+        private final Maat maat;
+        private final String prefix; // scope prefix (nullable), kept for cross-field chaining
+        private final String name;   // this field's leaf name
+
+        Value(Maat maat, String prefix, String name, T value) {
+            super(value);
+            this.maat = maat;
+            this.prefix = prefix;
+            this.name = name;
         }
 
-        // ---- type-changing parse (Validly's mustConvert) -------------------
+        @Override
+        Value<T> self() { return this; }
 
-        /**
-         * Parse/convert the value to a new type. On exception or null result,
-         * records an error and short-circuits; subsequent steps see a failed
-         * chain. A null input (optional, absent) is carried forward untouched.
-         */
-        public <R> Field<R> convert(Function<? super T, ? extends R> fn,
+        @Override
+        void capture(String code, String message) { maat.add(join(prefix, name), code, message); }
+
+        /** Start a fresh chain for another field in the same scope. */
+        public <R> Value<R> value(String name, R value) {
+            return new Value<R>(maat, prefix, name, value);
+        }
+
+        /** Record a parse failure for this field; the converted value is not retrievable. */
+        public <R> Value<R> convert(Function<? super T, ? extends R> fn,
                                     String code, String message) {
-            Field<R> next = new Field<R>(note, source, scope, field, null);
+            Value<R> next = new Value<R>(maat, prefix, name, null);
             next.failed = this.failed;
             if (failed || value == null) return next;
             try {
@@ -382,31 +368,99 @@ public final class Maat {
             }
             return next;
         }
-
-        // ---- terminals -----------------------------------------------------
-
-        /** True if this field accumulated no error (the whole Notification may still have others). */
-        public boolean ok() { return !failed; }
-
-        /** Best-effort value: the (possibly converted) value, or null if a step failed. */
-        public T get() { return failed ? null : value; }
-
-        public Optional<T> optional() { return Optional.ofNullable(get()); }
-
-        public T orElse(T fallback) { return failed || value == null ? fallback : value; }
     }
 
-    /** Carries the full Notification when a boundary chooses to throw rather than return. */
+    /**
+     * Static, report-free chain from {@link Maat#inline(Object)}. Captures the
+     * first failure locally and ends in:
+     * <ul>
+     *   <li>{@link #orElse(Object)} — value or default; never reports.</li>
+     *   <li>{@link #get()} — value, or throws {@link IllegalArgumentException}.</li>
+     *   <li>{@link #optional()} — present unless a check failed.</li>
+     *   <li>{@link #orElseAndReport(Object, Maat)} /
+     *       {@link #orElseAndReport(Object, MaatScope)} — bridge a failure into a
+     *       Maat (at root) or a scope (at the scope's path), returning the default.</li>
+     * </ul>
+     */
+    public static final class MaatInline<T> extends Check<MaatInline<T>, T> {
+        private String failCode;
+        private String failMessage;
+
+        MaatInline(T value) { super(value); }
+
+        @Override
+        MaatInline<T> self() { return this; }
+
+        @Override
+        void capture(String code, String message) {
+            this.failCode = code;
+            this.failMessage = message;
+        }
+
+        public <R> MaatInline<R> convert(Function<? super T, ? extends R> fn,
+                                         String code, String message) {
+            MaatInline<R> next = new MaatInline<R>(null);
+            next.failed = this.failed;
+            next.failCode = this.failCode;
+            next.failMessage = this.failMessage;
+            if (failed || value == null) return next;
+            try {
+                R converted = fn.apply(value);
+                if (converted == null) next.fail(code, message);
+                else next.value = converted;
+            } catch (RuntimeException ex) {
+                next.fail(code, message);
+            }
+            return next;
+        }
+
+        /** True if no check failed. */
+        public boolean ok() { return !failed; }
+
+        /** Value, or {@code fallback} if a check failed or the value is absent. Never reports. */
+        public T orElse(T fallback) { return (failed || value == null) ? fallback : value; }
+
+        /** Value (possibly null if absent), or throws if a check failed. Never reports. */
+        public T get() {
+            if (failed) throw new IllegalArgumentException(failMessage);
+            return value;
+        }
+
+        /** Present unless a check failed. */
+        public Optional<T> optional() {
+            return failed ? Optional.<T>empty() : Optional.ofNullable(value);
+        }
+
+        /** On failure, records the captured reason at root (no path) into {@code maat}; returns value or fallback. */
+        public T orElseAndReport(T fallback, Maat maat) {
+            if (failed) {
+                maat.add(null, failCode, failMessage);
+                return fallback;
+            }
+            return value;
+        }
+
+        /** On failure, records the captured reason at {@code scope}'s path; returns value or fallback. */
+        public T orElseAndReport(T fallback, MaatScope scope) {
+            if (failed) {
+                scope.reportHere(failCode, failMessage);
+                return fallback;
+            }
+            return value;
+        }
+    }
+
+    /** Carries the full Maat when a boundary chooses to throw rather than return. */
     public static final class ValidationException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
-        private final transient Notification notification;
+        private final transient Maat maat;
 
-        public ValidationException(Notification notification) {
-            super(notification.toString());
-            this.notification = notification;
+        public ValidationException(Maat maat) {
+            super(maat.toString());
+            this.maat = maat;
         }
 
-        public Notification notification() { return notification; }
+        public Maat maat() { return maat; }
     }
 }

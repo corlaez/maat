@@ -1,17 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Jakarta Validation API
+  ~
+  ~ License: Apache License, Version 2.0
+  ~ See the license.txt file in the root directory or <http://www.apache.org/licenses/LICENSE-2.0>.
+  -->
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>com.corlaez.validation</groupId>
   <artifactId>maat</artifactId>
+  <!-- NOTE: Central will NOT accept a -SNAPSHOT as a release. Bump to e.g. 1.0.0
+       (a non-SNAPSHOT version) when you actually publish. -->
   <version>1.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
+  <!-- ===== Required by Maven Central (name, description, url, licenses, developers, scm) ===== -->
   <name>maat</name>
-  <url>http://maven.apache.org</url>
+  <description>A tiny, zero-dependency, validation error accumulator for Java 8+: collect intrinsic (parse) and contextual (use-case) failures in one place and report them all at once.</description>
+  <url>https://github.com/corlaez/maat</url>
+
+  <licenses>
+    <license>
+      <name>Apache License</name>
+      <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <!-- TODO: your details (id/name/email are the conventional minimum) -->
+      <id>corlaez</id>
+      <name>Corlaez</name>
+      <email>you@example.com</email>
+      <url>https://github.com/corlaez</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <!-- TODO: match your real repo URLs -->
+    <connection>scm:git:https://github.com/corlaez/maat.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/corlaez/maat.git</developerConnection>
+    <url>https://github.com/corlaez/maat</url>
+    <tag>HEAD</tag>
+  </scm>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+    <!-- Compile the LIBRARY against the Java 8 API surface.
+         `release` (vs source/target) makes javac reject any newer API,
+         so a stray String.isBlank()/List.copyOf() fails the build instead
+         of slipping into the published bytecode. -->
+    <maven.compiler.release>8</maven.compiler.release>
+
+    <!-- Plugin versions pinned for reproducible builds.
+         These were current as of mid-2026 — check for newer before release. -->
+    <surefire.version>3.5.2</surefire.version>
+    <source-plugin.version>3.3.1</source-plugin.version>
+    <javadoc-plugin.version>3.11.2</javadoc-plugin.version>
+    <gpg-plugin.version>3.2.7</gpg-plugin.version>
+    <central-plugin.version>0.10.0</central-plugin.version>
   </properties>
 
   <dependencies>
@@ -22,4 +73,98 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- JUnit 5 test runner. Surefire 3.x discovers Jupiter natively. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${surefire.version}</version>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!--
+      Everything required for a valid Central bundle (sources jar, javadoc jar,
+      GPG signatures, and the Portal uploader) lives here so that day-to-day
+      `mvn install` stays fast and signature-free.
+
+      Publish with:   mvn -Prelease deploy
+      Prereqs:
+        * Verified namespace on central.sonatype.com
+            - groupId com.corlaez.* requires verifying the corlaez.com domain
+              (DNS TXT record). If you don't own that domain, switch the
+              groupId to io.github.corlaez (auto-verified via GitHub login).
+        * A published GPG key (gpg -$-gen-key; gpg -$-keyserver keyserver.ubuntu.com -$-send-keys <id>)
+        * A User Token from the Portal, placed in ~/.m2/settings.xml as:
+            <server>
+              <id>central</id>
+              <username>TOKEN_USERNAME</username>
+              <password>TOKEN_PASSWORD</password>
+            </server>
+    -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <!-- sources jar (required by Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>${source-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- javadoc jar (required by Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>${javadoc-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- GPG signatures (.asc) for every artifact (required by Central) -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>${gpg-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Uploads the signed bundle to the Central Portal on `deploy`. -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>${central-plugin.version}</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- Leave false to manually click "Publish" in the Portal after
+                   validation passes; set true to release automatically. -->
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
 </project>
