@@ -39,7 +39,7 @@ public class MaatTest {
                 .minLength(12, Error.MIN_LENGTH)
                         .value("validateThat", validateThis)
                                 .minLength(123123, Error.MIN_LENGTH);
-        Maat.Report<?> report = maat.report();
+        Maat.Report<Error> report = maat.report();
         Assertions.assertThrows(Maat.ValidationException.class, () -> {
             report.throwIfInvalid(Locale.getDefault());
         });

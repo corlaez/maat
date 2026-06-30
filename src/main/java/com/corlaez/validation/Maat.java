@@ -163,7 +163,7 @@ public final class Maat<T extends Enum<T> & MaatCode> {
 
     /** Snapshot everything recorded so far into an immutable {@link Report}. */
     public Report<T> report() {
-        return new Report<T>(sink);
+        return new Report<>(sink);
     }
 
     // ---- internal plumbing -------------------------------------------------
